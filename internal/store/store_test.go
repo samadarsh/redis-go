@@ -71,6 +71,35 @@ func TestDel(t *testing.T) {
 	}
 }
 
+func TestExists(t *testing.T) {
+	s := New()
+	if err := s.Set("a", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set("b", "2"); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		keys []string
+		want int
+	}{
+		{"missing key", []string{"nope"}, 0},
+		{"existing key", []string{"a"}, 1},
+		{"mixed keys", []string{"a", "nope", "b"}, 2},
+		{"duplicates counted each time", []string{"a", "a", "a"}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, err := s.Exists(tt.keys...)
+			if err != nil || n != tt.want {
+				t.Fatalf("Exists(%q) = %d, %v; want %d, nil", tt.keys, n, err, tt.want)
+			}
+		})
+	}
+}
+
 // Run with `go test -race` (make test does this): if Store has no lock,
 // the race detector fails this test.
 func TestConcurrentAccess(t *testing.T) {
@@ -85,6 +114,7 @@ func TestConcurrentAccess(t *testing.T) {
 			key := fmt.Sprintf("key-%d", i%5)
 			_ = s.Set(key, "v")
 			_, _, _ = s.Get(key)
+			_, _ = s.Exists(key)
 			_, _ = s.Del(key)
 		}(i)
 	}

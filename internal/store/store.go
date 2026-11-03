@@ -61,3 +61,17 @@ func (s *Store) Del(keys ...string) (deleted int, err error) {
 	}
 	return deleted, nil
 }
+
+// Exists returns how many of the given keys exist. A key listed more than
+// once is counted each time, like real Redis: EXISTS a a a returns 3.
+func (s *Store) Exists(keys ...string) (count int, err error) {
+	s.mu.RLock() // read lock: Exists only looks at the map, never changes it
+	defer s.mu.RUnlock()
+
+	for _, key := range keys {
+		if _, exists := s.data[key]; exists {
+			count++
+		}
+	}
+	return count, nil
+}

@@ -31,6 +31,7 @@ func NewHandler(s *store.Store) *Handler {
 		"SET":     h.set,
 		"GET":     h.get,
 		"DEL":     h.del,
+		"EXISTS":  h.exists,
 		// TODO(milestone 4): "EXISTS", "INCR", "EXPIRE", "TTL", ...
 	}
 	return h
@@ -113,6 +114,18 @@ func (h *Handler) del(args []string) resp.Value {
 	n, err := h.store.Del(args...)
 	if err != nil {
 		return storeError("DEL", err)
+	}
+	return resp.NewInteger(int64(n))
+}
+
+// EXISTS key [key ...] -> number of the given keys that exist
+func (h *Handler) exists(args []string) resp.Value {
+	if len(args) == 0 {
+		return wrongArgs("exists")
+	}
+	n, err := h.store.Exists(args...)
+	if err != nil {
+		return storeError("EXISTS", err)
 	}
 	return resp.NewInteger(int64(n))
 }
