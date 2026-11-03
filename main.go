@@ -10,6 +10,8 @@ import (
 	"flag"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,6 +27,7 @@ func main() {
 	debug := flag.Bool("debug", false, "log every connection and command")
 	aofPath := flag.String("aof", "appendonly.aof", `append-only file for persistence ("" disables it)`)
 	fsyncFlag := flag.String("appendfsync", "everysec", "how often to fsync the AOF: always, everysec or no")
+	pprofAddr := flag.String("pprof", "", `serve Go profiling endpoints on this address, e.g. "localhost:6060" (off by default)`)
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -33,6 +36,10 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log) // so warnings from internal packages (e.g. aof.Replay) use the same format
+
+	if *pprofAddr != "" {
+		startPprof(log, *pprofAddr)
+	}
 
 	policy, err := aof.ParsePolicy(*fsyncFlag)
 	if err != nil {
@@ -122,6 +129,29 @@ func main() {
 		exitCode = 1
 	}
 	os.Exit(exitCode)
+}
+
+// startPprof serves Go's profiler on addr, for example:
+//
+//	go tool pprof http://localhost:6060/debug/pprof/profile?seconds=10
+//
+// It uses its own ServeMux rather than the global one, so the endpoints only
+// exist when -pprof is set. They reveal internals, so keep addr on localhost.
+func startPprof(log *slog.Logger, addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index) // also serves heap, goroutine, allocs, mutex...
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	go func() {
+		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		if err := srv.ListenAndServe(); err != nil {
+			log.Error("pprof server stopped", "addr", addr, "err", err)
+		}
+	}()
+	log.Info("pprof enabled (keep this on localhost)", "url", "http://"+addr+"/debug/pprof/")
 }
 
 // closeAOF closes the AOF if there is one, and reports whether that worked.

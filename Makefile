@@ -1,4 +1,4 @@
-.PHONY: run build test cover fmt vet check clean
+.PHONY: run build test bench compare cover fmt vet check clean
 
 ADDR ?= :6379
 
@@ -13,6 +13,14 @@ build:
 ## test: run all tests with the race detector
 test:
 	go test -race ./...
+
+## bench: run the Go micro-benchmarks (with allocation counts)
+bench:
+	go test -run='^$$' -bench=. -benchmem ./...
+
+## compare: benchmark redis-go against real Redis with redis-benchmark
+compare:
+	./scripts/benchmark.sh
 
 ## cover: show test coverage per package
 cover:
