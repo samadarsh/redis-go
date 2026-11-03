@@ -42,6 +42,17 @@ func NewHandler(s *store.Store) *Handler {
 	return h
 }
 
+// Apply runs one command read back from the AOF on startup, using the same
+// code path as a client command. Only successful changes are ever logged,
+// so an error reply here means the file holds something this server can't
+// run, and replay must stop rather than load data that is silently wrong.
+func (h *Handler) Apply(args []string) error {
+	if reply := h.Handle(args); reply.Type == resp.Error {
+		return errors.New(reply.Str)
+	}
+	return nil
+}
+
 // Handle runs one command, e.g. ["SET", "name", "redis"], and returns the
 // reply to send to the client.
 func (h *Handler) Handle(args []string) resp.Value {

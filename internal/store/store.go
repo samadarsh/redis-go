@@ -24,14 +24,46 @@ var (
 // MSET handler checks this first, so a client never sees it.
 var ErrOddPairs = errors.New("MSet needs an even number of arguments (key value pairs)")
 
+// Logger records every change made to the Store, so it can be replayed
+// later. *aof.AOF implements it.
+type Logger interface {
+	Append(args ...string) error
+}
+
 // Store is a thread-safe map from string keys to string values.
 //
 // Every client connection runs in its own goroutine, so many goroutines
 // use the same Store at once. The RWMutex makes them take turns:
 // many readers can hold it together, but a writer gets it alone.
 type Store struct {
-	mu   sync.RWMutex      // the lock that protects data
-	data map[string]string // the actual key -> value storage
+	mu     sync.RWMutex      // the lock that protects data and logger
+	data   map[string]string // the actual key -> value storage
+	logger Logger            // optional; nil means changes are not recorded
+}
+
+// SetLogger attaches a Logger. From then on, every write method calls
+// l.Append WHILE HOLDING the write lock, before changing the map:
+//
+//	validate / compute  ->  l.Append  ->  apply to the map
+//
+// Holding the lock means the log order is always the same as the order the
+// changes were applied in. Logging first means that if Append fails, the
+// map is left unchanged, so memory and the file never disagree.
+//
+// Pass nil to stop logging. Attach the logger only AFTER replaying the AOF,
+// or replay would write every command back into the file.
+func (s *Store) SetLogger(l Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logger = l
+}
+
+// log records one change. The caller must hold s.mu.Lock().
+func (s *Store) log(cmd string, args ...string) error {
+	if s.logger == nil {
+		return nil
+	}
+	return s.logger.Append(append([]string{cmd}, args...)...)
 }
 
 // New returns an empty Store.
@@ -48,6 +80,9 @@ func (s *Store) Set(key, value string) error {
 	s.mu.Lock()         // write lock: everyone else waits
 	defer s.mu.Unlock() // released automatically when we return
 
+	if err := s.log("SET", key, value); err != nil {
+		return err // not saved to disk, so don't change memory either
+	}
 	s.data[key] = value
 	return nil
 }
@@ -64,16 +99,35 @@ func (s *Store) Get(key string) (value string, ok bool, err error) {
 
 // Del removes the given keys and returns how many of them actually existed.
 func (s *Store) Del(keys ...string) (deleted int, err error) {
-	s.mu.Lock() // one lock for the whole loop, so DEL a b c happens all at once
+	s.mu.Lock() // one lock for the whole thing, so DEL a b c happens all at once
 	defer s.mu.Unlock()
 
+	// 1. Work out which keys will actually be deleted (each one once,
+	//    so DEL a a a deletes and counts "a" a single time).
+	var toDelete []string
+	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
-		if _, exists := s.data[key]; exists {
-			delete(s.data, key)
-			deleted++
+		if _, exists := s.data[key]; !exists {
+			continue
 		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		toDelete = append(toDelete, key)
 	}
-	return deleted, nil
+	if len(toDelete) == 0 {
+		return 0, nil // nothing changes, so nothing to log
+	}
+
+	// 2. Log exactly what we are about to delete. 3. Then delete it.
+	if err := s.log("DEL", toDelete...); err != nil {
+		return 0, err
+	}
+	for _, key := range toDelete {
+		delete(s.data, key)
+	}
+	return len(toDelete), nil
 }
 
 // Exists returns how many of the given keys exist. A key listed more than
@@ -121,9 +175,17 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 		return 0, ErrOverflow
 	}
 
-	current += delta
-	s.data[key] = strconv.FormatInt(current, 10)
-	return current, nil
+	next := current + delta
+	str := strconv.FormatInt(next, 10)
+
+	// Log the RESULT ("SET counter 11"), not the operation ("INCRBY counter
+	// 1"). Replaying a SET gives the same value no matter what state the
+	// replay happens to be in, so it can't drift.
+	if err := s.log("SET", key, str); err != nil {
+		return 0, err
+	}
+	s.data[key] = str
+	return next, nil
 }
 
 // MSet stores several key/value pairs, given as a flat list:
@@ -136,10 +198,16 @@ func (s *Store) MSet(pairs ...string) error {
 	if len(pairs)%2 != 0 {
 		return ErrOddPairs // checked before locking, and nothing is changed
 	}
+	if len(pairs) == 0 {
+		return nil // nothing to set; logging a bare "MSET" would break replay
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.log("MSET", pairs...); err != nil {
+		return err
+	}
 	for i := 0; i < len(pairs); i += 2 {
 		s.data[pairs[i]] = pairs[i+1] // pairs[i] is a key, pairs[i+1] its value
 	}

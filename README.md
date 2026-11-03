@@ -65,6 +65,43 @@ printf 'PING\r\n' | nc localhost 6380
 | `MGET key [key ...]` | Returns the values of several keys, with null for missing ones |
 | `KEYS pattern` | Returns all keys matching a glob pattern (`*`, `?`, `[a-z]`, `[^a]`, `\`) |
 
+## Persistence
+
+Data survives a restart. Every command that changes data is appended to an
+**append-only file** (AOF) in the same RESP format a client sends, and on
+startup the file is replayed to rebuild the data. The file format is
+compatible with real Redis, which can load it.
+
+```console
+$ redis-cli -p 6380 set name sam
+OK
+# Ctrl+C the server, start it again, then:
+$ redis-cli -p 6380 get name
+"sam"
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-aof path` | `appendonly.aof` | Where to keep the AOF. `-aof ""` turns persistence off. |
+| `-appendfsync policy` | `everysec` | How often to fsync the file: `always`, `everysec` or `no`. |
+
+**Choosing `-appendfsync`.** A command is handed to the operating system
+as soon as it runs, so if only the *server* crashes, nothing is lost. The
+policy decides when the OS is forced to write the data to the physical
+disk, which is what protects you from a power cut or a kernel crash:
+
+| Policy | fsync | Lost on a power cut | Speed |
+|---|---|---|---|
+| `always` | after every write command | nothing that was acknowledged | slowest: every write waits for the disk |
+| `everysec` | once a second, in the background | about the last second of writes | fast (the Redis default) |
+| `no` | never; the OS decides | whatever the OS hadn't written yet (often up to ~30 s on Linux) | fastest |
+
+**If the server dies mid-write**, the last command in the file can be cut
+off. On startup, redis-go logs a warning, truncates the incomplete command
+and loads everything before it (like Redis's `aof-load-truncated yes`).
+Damage anywhere else in the file is treated as real corruption: the server
+refuses to start rather than run with silently missing data.
+
 ## How it works
 
 ```
@@ -106,7 +143,7 @@ the code exists, so `make test` always tells you where you are.
 - [x] **2. RESP protocol.** Parse commands, encode replies, handle pipelining and malformed input.
 - [x] **3. `SET` / `GET` / `DEL`.** Implement [`internal/store/store.go`](internal/store/store.go): a `map[string]string` protected by a `sync.RWMutex`. *Done when `make test` shows no skipped store tests.*
 - [x] **4. More commands.** `EXISTS`, `INCR`, `DECR`, `MGET`, `MSET`, `KEYS`. Add them in [`internal/server/commands.go`](internal/server/commands.go), with tests.
-- [ ] **5. Persistence (AOF).** Append every write command to a file, and replay it on startup so data survives a restart. *Done when you can `SET`, restart the server, and `GET` still works.*
+- [x] **5. Persistence (AOF).** Append every write command to a file, and replay it on startup so data survives a restart. *Done when you can `SET`, restart the server, and `GET` still works.*
 - [ ] **6. Expiry.** `EXPIRE`, `TTL`, `SET key value EX 10`. Lazy deletion on read, plus a background sweep.
 - [ ] **7. Benchmark and write it up.** Compare with real Redis using `redis-benchmark`, add the numbers here.
 

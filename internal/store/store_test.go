@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -335,4 +336,222 @@ func TestMSetAtomic(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// fakeLogger records every Append call. If err is set, it fails instead.
+type fakeLogger struct {
+	mu    sync.Mutex
+	calls [][]string
+	err   error
+
+	// store, if set, makes Append check that store's write lock is held,
+	// and record a violation if it isn't.
+	store      *Store
+	violations []string
+
+	// yield makes Append let other goroutines run first, so that a store
+	// that logs outside its lock gets caught reordering writes.
+	yield bool
+}
+
+func (f *fakeLogger) Append(args ...string) error {
+	if f.store != nil && f.store.mu.TryRLock() {
+		// We could take a read lock, so nobody holds the write lock: the
+		// store is logging outside its lock.
+		f.store.mu.RUnlock()
+		f.mu.Lock()
+		f.violations = append(f.violations, fmt.Sprint(args))
+		f.mu.Unlock()
+	}
+	if f.yield {
+		runtime.Gosched()
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.calls = append(f.calls, append([]string(nil), args...))
+	return nil
+}
+
+// take returns the calls recorded so far and clears them.
+func (f *fakeLogger) take() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	calls := f.calls
+	f.calls = nil
+	return calls
+}
+
+// snapshot returns every key and value in s.
+func snapshot(t *testing.T, s *Store) map[string]string {
+	t.Helper()
+	keys, err := s.Keys("*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vals, err := s.MGet(keys...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := make(map[string]string, len(keys))
+	for i, k := range keys {
+		m[k] = *vals[i]
+	}
+	return m
+}
+
+func TestWritesAreLogged(t *testing.T) {
+	s := New()
+	l := &fakeLogger{}
+	l.store = s // also check that every write logs while holding the lock
+	s.SetLogger(l)
+	defer func() {
+		for _, v := range l.violations {
+			t.Errorf("logged %s without holding the store's write lock", v)
+		}
+	}()
+
+	steps := []struct {
+		name    string
+		run     func() error
+		wantErr error
+		want    []string // the one logged command, or nil for "nothing logged"
+	}{
+		{"SET", func() error { return s.Set("a", "1") }, nil,
+			[]string{"SET", "a", "1"}},
+		{"MSET", func() error { return s.MSet("x", "1", "word", "abc") }, nil,
+			[]string{"MSET", "x", "1", "word", "abc"}},
+		{"INCR is logged as SET of the new value", func() error { _, err := s.IncrBy("x", 1); return err }, nil,
+			[]string{"SET", "x", "2"}},
+		{"DECR of a new key", func() error { _, err := s.IncrBy("n", -1); return err }, nil,
+			[]string{"SET", "n", "-1"}},
+		{"DEL logs only keys that existed, once each", func() error { _, err := s.Del("a", "missing", "a"); return err }, nil,
+			[]string{"DEL", "a"}},
+		{"SET max int64", func() error { return s.Set("big", "9223372036854775807") }, nil,
+			[]string{"SET", "big", "9223372036854775807"}},
+
+		// No-ops and failures change nothing, so they must log nothing.
+		{"DEL of missing keys", func() error { _, err := s.Del("missing", "a"); return err }, nil, nil},
+		{"DEL with no keys", func() error { _, err := s.Del(); return err }, nil, nil},
+		{"INCR of a non-integer", func() error { _, err := s.IncrBy("word", 1); return err }, ErrNotInteger, nil},
+		{"INCR overflow", func() error { _, err := s.IncrBy("big", 1); return err }, ErrOverflow, nil},
+		{"MSET with an odd number of args", func() error { return s.MSet("z") }, ErrOddPairs, nil},
+		{"MSET with no args", func() error { return s.MSet() }, nil, nil},
+		{"reads", func() error {
+			_, _, _ = s.Get("x")
+			_, _ = s.Exists("x")
+			_, _ = s.MGet("x", "n")
+			_, _ = s.Keys("*")
+			return nil
+		}, nil, nil},
+	}
+
+	for _, st := range steps {
+		err := st.run()
+		if !errors.Is(err, st.wantErr) {
+			t.Fatalf("%s: err = %v, want %v", st.name, err, st.wantErr)
+		}
+		got := l.take()
+		var want [][]string
+		if st.want != nil {
+			want = [][]string{st.want}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) || len(got) != len(want) {
+			t.Errorf("%s: logged %q, want %q", st.name, got, want)
+		}
+	}
+}
+
+// If the log can't be written, the change must not happen in memory either.
+func TestLoggerErrorLeavesMapUnchanged(t *testing.T) {
+	s := New()
+	if err := s.MSet("a", "1", "n", "5"); err != nil { // before a logger is attached
+		t.Fatal(err)
+	}
+	before := snapshot(t, s)
+
+	diskFull := errors.New("no space left on device")
+	s.SetLogger(&fakeLogger{err: diskFull})
+
+	ops := []struct {
+		name string
+		run  func() error
+	}{
+		{"SET existing", func() error { return s.Set("a", "2") }},
+		{"SET new", func() error { return s.Set("new", "x") }},
+		{"DEL", func() error { _, err := s.Del("a"); return err }},
+		{"INCR", func() error { _, err := s.IncrBy("n", 1); return err }},
+		{"INCR new key", func() error { _, err := s.IncrBy("fresh", 1); return err }},
+		{"MSET", func() error { return s.MSet("a", "9", "b", "9") }},
+	}
+	for _, op := range ops {
+		if err := op.run(); !errors.Is(err, diskFull) {
+			t.Errorf("%s: err = %v, want the logger's error", op.name, err)
+		}
+		if after := snapshot(t, s); fmt.Sprint(after) != fmt.Sprint(before) {
+			t.Fatalf("%s: data changed to %v after a failed log, want %v", op.name, after, before)
+		}
+	}
+}
+
+// The log must record changes in exactly the order they were applied, even
+// with many goroutines writing at once. Replaying the log into a fresh store
+// must rebuild exactly the same data.
+//
+// A wrong order only shows up at the end if it hits the LAST writes to a
+// key (any later write hides it). So instead of one long run, we do many
+// short rounds where every goroutine writes the same hot key, and check
+// after each round. TestWritesAreLogged also checks the lock directly.
+func TestLogOrderMatchesApplyOrder(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		s := New()
+		l := &fakeLogger{yield: true} // widens the window a buggy store would leave open
+		s.SetLogger(l)
+
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for i := 0; i < 8; i++ {
+					switch (g + i) % 4 {
+					case 0:
+						_ = s.Set("k", fmt.Sprint(g*100+i))
+					case 1:
+						_, _ = s.IncrBy("k", 1) // may fail if "k" was just deleted; that's fine
+					case 2:
+						_ = s.MSet("k", fmt.Sprint(g), "other", fmt.Sprint(i))
+					case 3:
+						_, _ = s.Del("k")
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+
+		replayed := New()
+		for _, c := range l.take() {
+			var err error
+			switch c[0] {
+			case "SET":
+				err = replayed.Set(c[1], c[2])
+			case "MSET":
+				err = replayed.MSet(c[1:]...)
+			case "DEL":
+				_, err = replayed.Del(c[1:]...)
+			default:
+				t.Fatalf("unexpected logged command %q", c)
+			}
+			if err != nil {
+				t.Fatalf("replaying %q: %v", c, err)
+			}
+		}
+
+		if got, want := snapshot(t, replayed), snapshot(t, s); fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("round %d: replaying the log gave %v, but the live store has %v", round, got, want)
+		}
+	}
 }
