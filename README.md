@@ -88,7 +88,7 @@ the code exists, so `make test` always tells you where you are.
 
 - [x] **1. TCP server.** Listen on a port, one goroutine per client, graceful shutdown. *Done when `redis-cli ping` replies `PONG`.*
 - [x] **2. RESP protocol.** Parse commands, encode replies, handle pipelining and malformed input.
-- [ ] **3. `SET` / `GET` / `DEL`.** Implement [`internal/store/store.go`](internal/store/store.go): a `map[string]string` protected by a `sync.RWMutex`. *Done when `make test` shows no skipped store tests.*
+- [x] **3. `SET` / `GET` / `DEL`.** Implement [`internal/store/store.go`](internal/store/store.go): a `map[string]string` protected by a `sync.RWMutex`. *Done when `make test` shows no skipped store tests.*
 - [ ] **4. More commands.** `EXISTS`, `INCR`, `DECR`, `MGET`, `MSET`, `KEYS`. Add them in [`internal/server/commands.go`](internal/server/commands.go), with tests.
 - [ ] **5. Persistence (AOF).** Append every write command to a file, and replay it on startup so data survives a restart. *Done when you can `SET`, restart the server, and `GET` still works.*
 - [ ] **6. Expiry.** `EXPIRE`, `TTL`, `SET key value EX 10`. Lazy deletion on read, plus a background sweep.

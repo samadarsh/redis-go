@@ -1,36 +1,29 @@
 // Package store holds the in-memory key-value data.
-//
-// ┌──────────────────────────────────────────────────────────────────────┐
-// │ YOUR JOB (Milestone 3): implement the methods in this file.          │
-// │                                                                      │
-// │ Each method currently returns ErrNotImplemented. The tests in        │
-// │ store_test.go skip themselves while that's true, so as soon as you   │
-// │ implement a method its tests start running and checking your work.   │
-// │ Run them with:  make test                                            │
-// └──────────────────────────────────────────────────────────────────────┘
 package store
 
-import "errors"
+import (
+	"errors"
+	"sync"
+)
 
-// ErrNotImplemented marks the parts of the skeleton you still have to write.
-// Delete it once every method is implemented.
+// ErrNotImplemented is still used by the tests and the command handler,
+// so keep it for now. We'll clean it up in a later milestone.
 var ErrNotImplemented = errors.New("not implemented yet")
 
 // Store is a thread-safe map from string keys to string values.
+//
+// Every client connection runs in its own goroutine, so many goroutines
+// use the same Store at once. The RWMutex makes them take turns:
+// many readers can hold it together, but a writer gets it alone.
 type Store struct {
-	// TODO(milestone 3): add the fields you need:
-	//
-	//   1. A map[string]string to hold the data.
-	//   2. A sync.RWMutex to protect it. Every client connection runs in
-	//      its own goroutine, so many goroutines read and write the map
-	//      at the same time. Without a lock, Go will crash with
-	//      "concurrent map writes" (and `go test -race` will catch it).
+	mu   sync.RWMutex      // the lock that protects data
+	data map[string]string // the actual key -> value storage
 }
 
 // New returns an empty Store.
 func New() *Store {
-	// TODO(milestone 3): initialise the map, e.g. data: make(map[string]string)
-	return &Store{}
+	// make() creates the map. Writing to a nil map would panic.
+	return &Store{data: make(map[string]string)}
 }
 
 // Set stores value under key, replacing any existing value.
@@ -38,21 +31,33 @@ func New() *Store {
 // It returns an error because in milestone 5 Set will also append to a
 // file on disk, and that write can fail.
 func (s *Store) Set(key, value string) error {
-	// TODO(milestone 3): take the write lock (s.mu.Lock / defer s.mu.Unlock)
-	// and store the value.
-	return ErrNotImplemented
+	s.mu.Lock()         // write lock: everyone else waits
+	defer s.mu.Unlock() // released automatically when we return
+
+	s.data[key] = value
+	return nil
 }
 
 // Get returns the value stored under key. ok is false if the key does not
 // exist.
 func (s *Store) Get(key string) (value string, ok bool, err error) {
-	// TODO(milestone 3): take the read lock (s.mu.RLock) and look up the key.
-	return "", false, ErrNotImplemented
+	s.mu.RLock() // read lock: other readers can run at the same time
+	defer s.mu.RUnlock()
+
+	value, ok = s.data[key] // "comma ok": ok tells us if the key exists
+	return value, ok, nil
 }
 
 // Del removes the given keys and returns how many of them actually existed.
 func (s *Store) Del(keys ...string) (deleted int, err error) {
-	// TODO(milestone 3): take the write lock, delete each key that exists,
-	// and count them.
-	return 0, ErrNotImplemented
+	s.mu.Lock() // one lock for the whole loop, so DEL a b c happens all at once
+	defer s.mu.Unlock()
+
+	for _, key := range keys {
+		if _, exists := s.data[key]; exists {
+			delete(s.data, key)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
