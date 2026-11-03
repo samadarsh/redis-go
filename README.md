@@ -1,6 +1,6 @@
 # redis-go
 
-**A Redis-compatible key-value server written from scratch in Go: it speaks the real Redis protocol, persists to disk, expires keys, and keeps up with real Redis in benchmarks.**
+**A Redis-compatible key-value server written from scratch in Go: it speaks the real Redis protocol, persists to disk, expires keys, and reaches ~90% of real Redis's throughput.**
 
 [![CI](https://github.com/samadarsh/redis-go/actions/workflows/ci.yml/badge.svg)](https://github.com/samadarsh/redis-go/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go)
@@ -15,7 +15,7 @@
 - **17 commands:** `GET` `SET` (with `EX`/`PX`/`PXAT`) `DEL` `EXISTS` `INCR` `DECR` `MSET` `MGET` `KEYS` (glob patterns) `EXPIRE` `PEXPIRE` `PEXPIREAT` `TTL` `PTTL` `PERSIST` `PING` `ECHO`.
 - **Thread-safe store** shared by one goroutine per client, with atomic multi-key commands.
 - **AOF persistence** with `always` / `everysec` / `no` fsync policies, crash recovery, and a file format that real Redis can load.
-- **Key expiry**, lazy and active, exactly like Redis, and safe across restarts.
+- **Key expiry**, lazy and active, using Redis's own sampling algorithm, and safe across restarts.
 - **Graceful shutdown** on Ctrl+C: finishes in-flight commands, then flushes and fsyncs the AOF.
 - **Tested hard:** 59 tests with the race detector in CI, fake clocks instead of sleeps, end-to-end restart tests, and replies checked against real Redis. Zero external dependencies.
 
@@ -90,7 +90,7 @@ Results vary by about ±10% between runs.
 **An honest reading of these numbers:**
 
 - **Without pipelining, the network round trip is the limit, not the server.** Each client waits for a reply before sending the next request. CPU profiles show redis-go spends about 52% of its time in `read`/`write` system calls and most of the rest waking goroutines up; under 1% goes to parsing and running commands. Both servers end up near the same number.
-- **Where redis-go "beats" Redis, it's because it uses several cores and Redis uses one.** redis-go ran at ~310% CPU; Redis executes all commands on a single thread. Per core, Redis is clearly more efficient. The big MSET number also reflects that Redis does work redis-go skips (keyspace notifications, `WATCH` invalidation, replication bookkeeping).
+- **Where redis-go "beats" Redis, it's because it uses several cores and Redis uses one.** redis-go ran at ~310% CPU; Redis executes all commands on a single thread. Per core, Redis is clearly more efficient. Even on one core, though, redis-go's pipelined MSET is 146% of Redis's, and I haven't measured why. My unverified guess is per-key bookkeeping that redis-go doesn't do (keyspace notifications, `WATCH` invalidation, replication), but I haven't profiled Redis to confirm it.
 - **Why real Redis is faster where it counts:** it's tuned C with no garbage collector and its own event loop, so it has none of Go's goroutine-scheduling overhead. It also stores small integers *as integers*, so `INCR` does no string parsing. redis-go parses and re-formats the number while holding the store's global write lock, which is why pipelined `INCR` is at 58%: there, clients spend about 11% of CPU waiting for that lock.
 - **Surprise:** redis-go on *one* core beat itself on 11 cores without pipelining (~212k vs ~167k req/s). Passing work between cores costs more than it saves when each request is this small.
 
@@ -159,7 +159,15 @@ That's an array (`*`) of 3 bulk strings (`$`), each prefixed by its length. The 
 
 ## Persistence
 
-Every command that changes data is appended to the AOF in RESP format, and on startup the file is replayed to rebuild the data. Real Redis can load the file too.
+Every command that changes data is appended to the AOF in RESP format, and on startup the file is replayed to rebuild the data.
+
+**Real Redis can load the file.** This was tested with Redis 8.10.3: it rebuilt exactly the same keys, values and TTLs as redis-go. Redis 7+ normally stores its AOF as several files in an `appendonlydir/` directory, listed in a manifest (a *base* file plus *incremental* files). When it finds a single old-style `appendonly.aof` instead, it **moves** that file into `appendonlydir/` as the base file and starts a new incremental file, so give it a copy:
+
+```bash
+mkdir /tmp/r && cp appendonly.aof /tmp/r/
+redis-server --port 6399 --dir /tmp/r --appendonly yes --save ""
+# log: "Successfully migrated an old-style AOF file (appendonly.aof) into the AOF directory"
+```
 
 **Choosing `-appendfsync`.** A command is handed to the operating system as soon as it runs, so if only the *server* crashes (even `kill -9`), nothing is lost. The policy decides when the OS is forced to write to the physical disk, which is what protects you from a power cut:
 
