@@ -34,6 +34,9 @@ func NewHandler(s *store.Store) *Handler {
 		"EXISTS":  h.exists,
 		"INCR":    h.incr,
 		"DECR":    h.decr,
+		"MSET":    h.mset,
+		"MGET":    h.mget,
+		"KEYS":    h.keys,
 		// TODO(milestone 4): "EXISTS", "INCR", "EXPIRE", "TTL", ...
 	}
 	return h
@@ -157,6 +160,55 @@ func (h *Handler) incrBy(cmd, key string, delta int64) resp.Value {
 		return storeError(cmd, err)
 	}
 	return resp.NewInteger(n)
+}
+
+// MSET key value [key value ...] -> OK
+func (h *Handler) mset(args []string) resp.Value {
+	if len(args) == 0 || len(args)%2 != 0 {
+		return wrongArgs("mset")
+	}
+	if err := h.store.MSet(args...); err != nil {
+		return storeError("MSET", err)
+	}
+	return resp.OK()
+}
+
+// MGET key [key ...] -> array with one entry per key, null where a key is missing
+func (h *Handler) mget(args []string) resp.Value {
+	if len(args) == 0 {
+		return wrongArgs("mget")
+	}
+	values, err := h.store.MGet(args...)
+	if err != nil {
+		return storeError("MGET", err)
+	}
+
+	reply := make([]resp.Value, len(values))
+	for i, v := range values {
+		if v == nil {
+			reply[i] = resp.NullBulkString()
+		} else {
+			reply[i] = resp.NewBulkString(*v)
+		}
+	}
+	return resp.NewArray(reply...)
+}
+
+// KEYS pattern -> sorted array of the keys matching pattern (empty if none)
+func (h *Handler) keys(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("keys")
+	}
+	keys, err := h.store.Keys(args[0])
+	if err != nil {
+		return storeError("KEYS", err)
+	}
+
+	reply := make([]resp.Value, len(keys))
+	for i, k := range keys {
+		reply[i] = resp.NewBulkString(k)
+	}
+	return resp.NewArray(reply...) // NewArray turns "no values" into an empty array, not null
 }
 
 func wrongArgs(cmd string) resp.Value {

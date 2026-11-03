@@ -211,3 +211,128 @@ func TestIncrConcurrent(t *testing.T) {
 		t.Fatalf("counter = %s after %d concurrent INCRs, want %d", got, n, n)
 	}
 }
+
+func TestMSet(t *testing.T) {
+	s := New()
+	if err := s.MSet("a", "1", "b", "2", "a", "3"); err != nil {
+		t.Fatalf("MSet: %v", err)
+	}
+	if v, _, _ := s.Get("a"); v != "3" {
+		t.Errorf(`a = %q after MSet a 1 b 2 a 3, want "3" (last one wins)`, v)
+	}
+	if v, _, _ := s.Get("b"); v != "2" {
+		t.Errorf(`b = %q, want "2"`, v)
+	}
+
+	// An odd number of arguments is rejected, and nothing is changed.
+	if err := s.MSet("a", "9", "c"); !errors.Is(err, ErrOddPairs) {
+		t.Fatalf("MSet with odd args: err = %v, want ErrOddPairs", err)
+	}
+	if v, _, _ := s.Get("a"); v != "3" {
+		t.Errorf(`a = %q after a rejected MSet, want "3" unchanged`, v)
+	}
+	if _, ok, _ := s.Get("c"); ok {
+		t.Error(`key "c" was set by a rejected MSet`)
+	}
+}
+
+func TestMGet(t *testing.T) {
+	s := New()
+	if err := s.MSet("a", "1", "empty", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.MGet("missing", "a", "empty", "a", "also-missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []*string{nil, ptr("1"), ptr(""), ptr("1"), nil}
+
+	if len(got) != len(want) {
+		t.Fatalf("MGet returned %d values, want %d", len(got), len(want))
+	}
+	for i := range want {
+		switch {
+		case want[i] == nil && got[i] != nil:
+			t.Errorf("value %d = %q, want nil (missing)", i, *got[i])
+		case want[i] != nil && got[i] == nil:
+			t.Errorf("value %d = nil, want %q", i, *want[i])
+		case want[i] != nil && *got[i] != *want[i]:
+			t.Errorf("value %d = %q, want %q", i, *got[i], *want[i])
+		}
+	}
+}
+
+func TestKeys(t *testing.T) {
+	s := New()
+
+	// An empty store gives an empty (non-nil) slice.
+	got, err := s.Keys("*")
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("Keys(*) on empty store = %#v, %v; want []string{}, nil", got, err)
+	}
+
+	if err := s.MSet("user:2", "x", "user:1", "x", "session:1", "x", "a/b", "x"); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		pattern string
+		want    []string
+	}{
+		{"*", []string{"a/b", "session:1", "user:1", "user:2"}}, // sorted
+		{"user:*", []string{"user:1", "user:2"}},
+		{"*:1", []string{"session:1", "user:1"}},
+		{"user:[2-9]", []string{"user:2"}},
+		{"nope*", []string{}},
+	}
+	for _, tt := range tests {
+		got, err := s.Keys(tt.pattern)
+		if err != nil || fmt.Sprint(got) != fmt.Sprint(tt.want) || got == nil {
+			t.Errorf("Keys(%q) = %#v, %v; want %#v", tt.pattern, got, err, tt.want)
+		}
+	}
+}
+
+// MSET must be atomic: a reader must never see a half-applied MSET. One
+// goroutine flips a and b between "x" and "y" together; readers check that
+// a and b always agree. With a Set() loop instead of one lock, they would
+// sometimes see a="y", b="x".
+func TestMSetAtomic(t *testing.T) {
+	s := New()
+	if err := s.MSet("a", "x", "b", "x"); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() { // the writer
+		defer wg.Done()
+		defer close(done) // tell the readers to stop
+		for i := 0; i < 2000; i++ {
+			_ = s.MSet("a", "x", "b", "x")
+			_ = s.MSet("a", "y", "b", "y")
+		}
+	}()
+
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() { // the readers
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				vals, _ := s.MGet("a", "b")
+				if *vals[0] != *vals[1] {
+					t.Errorf("saw a half-applied MSET: a=%q b=%q", *vals[0], *vals[1])
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

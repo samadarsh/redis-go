@@ -4,6 +4,7 @@ package store
 import (
 	"errors"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -18,6 +19,10 @@ var (
 	ErrNotInteger = errors.New("value is not an integer or out of range")
 	ErrOverflow   = errors.New("increment or decrement would overflow")
 )
+
+// ErrOddPairs is returned by MSet when it is not given key/value pairs. The
+// MSET handler checks this first, so a client never sees it.
+var ErrOddPairs = errors.New("MSet needs an even number of arguments (key value pairs)")
 
 // Store is a thread-safe map from string keys to string values.
 //
@@ -119,6 +124,65 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	current += delta
 	s.data[key] = strconv.FormatInt(current, 10)
 	return current, nil
+}
+
+// MSet stores several key/value pairs, given as a flat list:
+// MSet("k1", "v1", "k2", "v2"). Pairs are applied in order, so if a key
+// appears twice the last value wins, like real Redis.
+//
+// Every pair is set under one write lock, so MSET is atomic: no other
+// client can ever see only some of the keys updated.
+func (s *Store) MSet(pairs ...string) error {
+	if len(pairs)%2 != 0 {
+		return ErrOddPairs // checked before locking, and nothing is changed
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := 0; i < len(pairs); i += 2 {
+		s.data[pairs[i]] = pairs[i+1] // pairs[i] is a key, pairs[i+1] its value
+	}
+	return nil
+}
+
+// MGet returns the value of each key, in the same order as keys. A missing
+// key gives a nil pointer, which is how we tell "missing" apart from an
+// existing key whose value is the empty string "".
+//
+// All keys are read under one read lock, so the result is a consistent
+// snapshot: an MSET from another client is either fully visible or not at all.
+func (s *Store) MGet(keys ...string) ([]*string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	values := make([]*string, len(keys)) // starts as all nil, i.e. all missing
+	for i, key := range keys {
+		if v, ok := s.data[key]; ok {
+			values[i] = &v // v is a new variable each iteration, so each pointer is distinct
+		}
+	}
+	return values, nil
+}
+
+// Keys returns every key matching a Redis glob pattern (see globMatch),
+// sorted so the output is deterministic. With no matches it returns an
+// empty slice.
+//
+// It looks at every key in the store, which is why real Redis warns
+// against using KEYS on a large production database.
+func (s *Store) Keys(pattern string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	matches := []string{}
+	for key := range s.data {
+		if globMatch(pattern, key) {
+			matches = append(matches, key)
+		}
+	}
+	sort.Strings(matches) // Go map iteration order is random
+	return matches, nil
 }
 
 // parseInt parses s as a base-10 int64 as strictly as Redis does.

@@ -126,3 +126,51 @@ func TestIncrDecrCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestMSetMGetKeysCommands(t *testing.T) {
+	h := NewHandler(store.New())
+
+	steps := []struct {
+		args []string
+		want resp.Value
+	}{
+		// Wrong number of arguments.
+		{[]string{"MSET"}, resp.NewError("ERR wrong number of arguments for 'mset' command")},
+		{[]string{"MSET", "a"}, resp.NewError("ERR wrong number of arguments for 'mset' command")},
+		{[]string{"MSET", "a", "1", "b"}, resp.NewError("ERR wrong number of arguments for 'mset' command")},
+		{[]string{"MGET"}, resp.NewError("ERR wrong number of arguments for 'mget' command")},
+		{[]string{"KEYS"}, resp.NewError("ERR wrong number of arguments for 'keys' command")},
+		{[]string{"KEYS", "a", "b"}, resp.NewError("ERR wrong number of arguments for 'keys' command")},
+
+		// KEYS on an empty store is an empty array, not null.
+		{[]string{"KEYS", "*"}, resp.NewArray()},
+
+		// MSET, last one wins; MGET keeps order and puts null where a key is missing.
+		{[]string{"MSET", "a", "1", "b", "2", "a", "3"}, resp.OK()},
+		{[]string{"mget", "a", "missing", "b"}, resp.NewArray(
+			resp.NewBulkString("3"),
+			resp.NullBulkString(),
+			resp.NewBulkString("2"),
+		)},
+
+		// KEYS returns sorted matches, and * matches "/".
+		{[]string{"MSET", "user:2", "x", "user:1", "x", "a/b", "x"}, resp.OK()},
+		{[]string{"KEYS", "*"}, resp.NewArray(
+			resp.NewBulkString("a"),
+			resp.NewBulkString("a/b"),
+			resp.NewBulkString("b"),
+			resp.NewBulkString("user:1"),
+			resp.NewBulkString("user:2"),
+		)},
+		{[]string{"KEYS", "user:*"}, resp.NewArray(
+			resp.NewBulkString("user:1"),
+			resp.NewBulkString("user:2"),
+		)},
+		{[]string{"KEYS", "nope*"}, resp.NewArray()},
+	}
+	for _, s := range steps {
+		if got := h.Handle(s.args); !reflect.DeepEqual(got, s.want) {
+			t.Errorf("Handle(%q) = %#v, want %#v", s.args, got, s.want)
+		}
+	}
+}
