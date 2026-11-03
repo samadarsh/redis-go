@@ -1,0 +1,12 @@
+# Build output
+/bin/
+/redis-go
+
+# Persistence files (milestone 5)
+*.aof
+*.rdb
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
