@@ -54,6 +54,7 @@ func main() {
 	} else {
 		start := time.Now()
 		replayed := 0
+		st.SetLoading(true) // nothing expires during replay (see store.SetLoading)
 		err := aof.Replay(*aofPath, func(args []string) error {
 			if err := handler.Apply(args); err != nil {
 				return err
@@ -61,6 +62,7 @@ func main() {
 			replayed++
 			return nil
 		})
+		st.SetLoading(false) // now keys whose time has passed expire as normal
 		if err != nil {
 			log.Error("cannot load AOF; refusing to start with incomplete data", "file", *aofPath, "err", err)
 			os.Exit(1)
@@ -76,9 +78,15 @@ func main() {
 		log.Info("persistence enabled", "file", *aofPath, "appendfsync", string(policy))
 	}
 
+	// Active expiry: every 100ms, delete a sample of expired keys that nobody
+	// has read (Redis's default "hz 10" runs it 10 times a second). Started
+	// after replay, so it never races with loading the file.
+	stopExpiry := st.StartActiveExpiry(100 * time.Millisecond)
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Error("cannot listen", "addr", *addr, "err", err)
+		stopExpiry()
 		closeAOF(log, appendLog)
 		os.Exit(1)
 	}
@@ -106,6 +114,8 @@ func main() {
 			exitCode = 1
 		}
 	}
+
+	stopExpiry() // stops the goroutine and waits for it to exit
 
 	// THEN flush, fsync and close the AOF, so every acknowledged write is on disk.
 	if !closeAOF(log, appendLog) {

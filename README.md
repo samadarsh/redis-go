@@ -55,15 +55,26 @@ printf 'PING\r\n' | nc localhost 6380
 |---|---|
 | `PING [message]` | Replies `PONG`, or echoes `message` back |
 | `ECHO message` | Replies with `message` |
-| `SET key value` | Stores `value` under `key`, replacing any old value |
+| `SET key value [EX seconds \| PX ms \| PXAT unix-ms]` | Stores `value` under `key`, optionally with an expiry. A plain `SET` removes any old expiry |
 | `GET key` | Returns the value of `key`, or null if it doesn't exist |
 | `DEL key [key ...]` | Deletes the keys and returns how many existed |
 | `EXISTS key [key ...]` | Returns how many of the keys exist (repeats are counted each time) |
-| `INCR key` | Adds 1 to the integer in `key` (a missing key starts at 0) and returns the result |
-| `DECR key` | Subtracts 1 from the integer in `key` (a missing key starts at 0) and returns the result |
+| `INCR key` | Adds 1 to the integer in `key` (a missing key starts at 0) and returns the result. Keeps the key's expiry |
+| `DECR key` | Subtracts 1 from the integer in `key` (a missing key starts at 0) and returns the result. Keeps the key's expiry |
 | `MSET key value [key value ...]` | Sets several keys at once, atomically |
 | `MGET key [key ...]` | Returns the values of several keys, with null for missing ones |
 | `KEYS pattern` | Returns all keys matching a glob pattern (`*`, `?`, `[a-z]`, `[^a]`, `\`) |
+| `EXPIRE key seconds` | Makes `key` expire after `seconds`. Returns 1, or 0 if the key doesn't exist. Zero or negative deletes it |
+| `PEXPIRE key ms` | Like `EXPIRE`, in milliseconds |
+| `PEXPIREAT key unix-ms` | Makes `key` expire at an absolute time (this is how the AOF stores every expiry) |
+| `TTL key` | Seconds left: `-1` if the key has no expiry, `-2` if it doesn't exist |
+| `PTTL key` | Like `TTL`, in milliseconds |
+| `PERSIST key` | Removes the expiry. Returns 1 if there was one, else 0 |
+
+Expired keys are removed in two ways, like Redis: **lazily** (any command
+that touches an expired key treats it as missing) and **actively** (a
+background task checks a random sample of keys with an expiry 10 times a
+second, and deletes the expired ones).
 
 ## Persistence
 
@@ -144,7 +155,7 @@ the code exists, so `make test` always tells you where you are.
 - [x] **3. `SET` / `GET` / `DEL`.** Implement [`internal/store/store.go`](internal/store/store.go): a `map[string]string` protected by a `sync.RWMutex`. *Done when `make test` shows no skipped store tests.*
 - [x] **4. More commands.** `EXISTS`, `INCR`, `DECR`, `MGET`, `MSET`, `KEYS`. Add them in [`internal/server/commands.go`](internal/server/commands.go), with tests.
 - [x] **5. Persistence (AOF).** Append every write command to a file, and replay it on startup so data survives a restart. *Done when you can `SET`, restart the server, and `GET` still works.*
-- [ ] **6. Expiry.** `EXPIRE`, `TTL`, `SET key value EX 10`. Lazy deletion on read, plus a background sweep.
+- [x] **6. Expiry.** `EXPIRE`, `TTL`, `SET key value EX 10`. Lazy deletion on read, plus a background sweep.
 - [ ] **7. Benchmark and write it up.** Compare with real Redis using `redis-benchmark`, add the numbers here.
 
 **Stretch goals:** lists (`LPUSH`/`LRANGE`), hashes (`HSET`/`HGET`),

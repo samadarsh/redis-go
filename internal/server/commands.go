@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/samadarsh/redis-go/internal/resp"
@@ -37,7 +38,15 @@ func NewHandler(s *store.Store) *Handler {
 		"MSET":    h.mset,
 		"MGET":    h.mget,
 		"KEYS":    h.keys,
-		// TODO(milestone 4): "EXISTS", "INCR", "EXPIRE", "TTL", ...
+
+		// Expiry (milestone 6).
+		"EXPIRE":    h.expire,
+		"PEXPIRE":   h.pexpire,
+		"PEXPIREAT": h.pexpireat,
+		"TTL":       h.ttl,
+		"PTTL":      h.pttl,
+		"PERSIST":   h.persist,
+		// TODO: more commands (stretch goals in the README).
 	}
 	return h
 }
@@ -96,15 +105,180 @@ func (h *Handler) command(args []string) resp.Value {
 
 // SET key value -> OK
 //
-// TODO(milestone 6): support options like "SET key value EX 10".
+// SET key value [EX seconds | PX milliseconds | PXAT unix-milliseconds] -> OK
+//
+// EX and PX are relative ("in 10 seconds"); PXAT is absolute. The AOF logs
+// every SET with an expiry as PXAT, so replay needs PXAT too.
 func (h *Handler) set(args []string) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return wrongArgs("set")
 	}
-	if err := h.store.Set(args[0], args[1]); err != nil {
+	key, value := args[0], args[1]
+
+	// 1. Read the options. Like Redis, check the syntax of ALL of them
+	//    before looking at any value, so "SET k v EX abc PX 5" is a syntax
+	//    error (EX and PX together), not "not an integer".
+	var unit, raw string // e.g. "EX", "10"
+	for i := 2; i < len(args); i++ {
+		switch opt := strings.ToUpper(args[i]); opt {
+		case "EX", "PX", "PXAT":
+			// Two DIFFERENT expiry options (EX with PX) is a syntax error, but
+			// repeating the same one is allowed and the last value wins,
+			// exactly like Redis. No value after the option is also an error.
+			if (unit != "" && unit != opt) || i+1 >= len(args) {
+				return syntaxError()
+			}
+			unit, raw = opt, args[i+1]
+			i++ // skip the value we just used
+		default:
+			return syntaxError() // unknown option (NX, XX, GET... aren't supported)
+		}
+	}
+
+	if unit == "" {
+		if err := h.store.Set(key, value); err != nil {
+			return storeError("SET", err)
+		}
+		return resp.OK()
+	}
+
+	// 2. Turn the option into an absolute expiry time.
+	n, ok := store.ParseInt(raw)
+	if !ok {
+		return resp.NewError("ERR value is not an integer or out of range")
+	}
+	if n <= 0 {
+		return invalidExpire("set")
+	}
+	var atMs int64
+	switch unit {
+	case "EX":
+		atMs, ok = addMs(h.store.NowMs(), n, 1000)
+	case "PX":
+		atMs, ok = addMs(h.store.NowMs(), n, 1)
+	case "PXAT":
+		atMs, ok = n, true
+	}
+	if !ok {
+		return invalidExpire("set") // so far in the future it doesn't fit in an int64
+	}
+
+	if err := h.store.SetExpireAt(key, value, atMs); err != nil {
 		return storeError("SET", err)
 	}
 	return resp.OK()
+}
+
+// EXPIRE key seconds -> 1 if the timeout was set, 0 if the key doesn't exist
+func (h *Handler) expire(args []string) resp.Value {
+	return h.expireGeneric("expire", args, 1000, false)
+}
+
+// PEXPIRE key milliseconds -> like EXPIRE, in milliseconds
+func (h *Handler) pexpire(args []string) resp.Value {
+	return h.expireGeneric("pexpire", args, 1, false)
+}
+
+// PEXPIREAT key unix-milliseconds -> like PEXPIRE, but with an absolute time.
+// This is how the AOF records every expiry.
+func (h *Handler) pexpireat(args []string) resp.Value {
+	return h.expireGeneric("pexpireat", args, 1, true)
+}
+
+// expireGeneric is the shared part of EXPIRE, PEXPIRE and PEXPIREAT.
+// unitMs is how many milliseconds one unit is (1000 for seconds). A zero or
+// negative timeout, or a time in the past, deletes the key (and returns 1).
+func (h *Handler) expireGeneric(cmd string, args []string, unitMs int64, absolute bool) resp.Value {
+	if len(args) != 2 {
+		return wrongArgs(cmd)
+	}
+	n, ok := store.ParseInt(args[1])
+	if !ok {
+		return resp.NewError("ERR value is not an integer or out of range")
+	}
+
+	atMs := n
+	if !absolute {
+		if atMs, ok = addMs(h.store.NowMs(), n, unitMs); !ok {
+			return invalidExpire(cmd)
+		}
+	}
+
+	set, err := h.store.PExpireAt(args[0], atMs)
+	if err != nil {
+		return storeError(strings.ToUpper(cmd), err)
+	}
+	return boolReply(set)
+}
+
+// TTL key -> seconds left, -1 if the key has no expiry, -2 if it doesn't exist
+func (h *Handler) ttl(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("ttl")
+	}
+	ms, err := h.store.PTTL(args[0])
+	if err != nil {
+		return storeError("TTL", err)
+	}
+	if ms < 0 {
+		return resp.NewInteger(ms) // -1 or -2
+	}
+	return resp.NewInteger((ms + 500) / 1000) // rounded to the nearest second, like Redis
+}
+
+// PTTL key -> milliseconds left, -1 if the key has no expiry, -2 if it doesn't exist
+func (h *Handler) pttl(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("pttl")
+	}
+	ms, err := h.store.PTTL(args[0])
+	if err != nil {
+		return storeError("PTTL", err)
+	}
+	return resp.NewInteger(ms)
+}
+
+// PERSIST key -> 1 if a timeout was removed, 0 otherwise
+func (h *Handler) persist(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("persist")
+	}
+	removed, err := h.store.Persist(args[0])
+	if err != nil {
+		return storeError("PERSIST", err)
+	}
+	return boolReply(removed)
+}
+
+// addMs returns nowMs + n*unitMs, or ok=false if that doesn't fit in an
+// int64. The checks come BEFORE the arithmetic, for the same reason as in
+// INCR: Go integers silently wrap around on overflow.
+//
+// (Real Redis 8 accepts "SET k v PX 9223372036854775807": its C code checks
+// for overflow AFTER adding, which is undefined behaviour in C, so the
+// compiler may remove the check. Rejecting it is what that check intends.)
+func addMs(nowMs, n, unitMs int64) (int64, bool) {
+	if n > math.MaxInt64/unitMs || n < math.MinInt64/unitMs {
+		return 0, false
+	}
+	ms := n * unitMs
+	if ms > 0 && nowMs > math.MaxInt64-ms {
+		return 0, false
+	}
+	return nowMs + ms, true // nowMs is positive, so adding a negative ms can't underflow
+}
+
+func boolReply(b bool) resp.Value {
+	if b {
+		return resp.NewInteger(1)
+	}
+	return resp.NewInteger(0)
+}
+
+func syntaxError() resp.Value { return resp.NewError("ERR syntax error") }
+
+func invalidExpire(cmd string) resp.Value {
+	return resp.NewError(fmt.Sprintf("ERR invalid expire time in '%s' command", cmd))
 }
 
 // GET key -> value, or null if the key does not exist

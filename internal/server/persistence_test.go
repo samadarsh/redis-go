@@ -20,11 +20,20 @@ import (
 // returned stop function shuts down in main.go's order: server first, then AOF.
 func startPersistentServer(t *testing.T, path string) (addr string, stop func()) {
 	t.Helper()
+	return startPersistentServerWithClock(t, path, time.Now)
+}
+
+// startPersistentServerWithClock is startPersistentServer with a fake clock.
+func startPersistentServerWithClock(t *testing.T, path string, now func() time.Time) (addr string, stop func()) {
+	t.Helper()
 	st := store.New()
+	st.SetClock(now) // set before replay, so expiry afterwards uses this clock
 	h := NewHandler(st)
+	st.SetLoading(true)
 	if err := aof.Replay(path, h.Apply); err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
+	st.SetLoading(false)
 	a, err := aof.Open(path, aof.EverySec)
 	if err != nil {
 		t.Fatal(err)
@@ -168,5 +177,46 @@ func TestDataSurvivesRestart(t *testing.T) {
 	}
 	if !reflect.DeepEqual(logged, want) {
 		t.Errorf("AOF after a restart holds\n%q\nwant\n%q", logged, want)
+	}
+}
+
+// SET ... EX through a real server and a real AOF file, an hour of downtime,
+// then a new server on the same file: expired keys must not come back.
+func TestExpiredKeysStayGoneAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	clock := newFakeClock()
+
+	addr, stop := startPersistentServerWithClock(t, path, clock.Now)
+	c := dialClient(t, addr)
+	for _, w := range []struct {
+		args []string
+		want resp.Value
+	}{
+		{[]string{"SET", "session", "abc", "EX", "10"}, resp.OK()},
+		{[]string{"SET", "cache", "xyz", "EX", "7200"}, resp.OK()},
+		{[]string{"SET", "name", "sam"}, resp.OK()},
+	} {
+		if got := c.do(w.args...); !reflect.DeepEqual(got, w.want) {
+			t.Fatalf("%q = %#v, want %#v", w.args, got, w.want)
+		}
+	}
+	stop()
+
+	clock.Advance(time.Hour) // the server is "down" for an hour
+
+	addr2, _ := startPersistentServerWithClock(t, path, clock.Now)
+	c2 := dialClient(t, addr2)
+	for _, r := range []struct {
+		args []string
+		want resp.Value
+	}{
+		{[]string{"GET", "session"}, resp.NullBulkString()}, // expired while down
+		{[]string{"TTL", "cache"}, resp.NewInteger(3600)},   // 1 hour left, not 2
+		{[]string{"GET", "name"}, resp.NewBulkString("sam")},
+		{[]string{"TTL", "name"}, resp.NewInteger(-1)},
+	} {
+		if got := c2.do(r.args...); !reflect.DeepEqual(got, r.want) {
+			t.Errorf("after restart: %q = %#v, want %#v", r.args, got, r.want)
+		}
 	}
 }
