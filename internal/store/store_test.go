@@ -120,3 +120,94 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestIncrBy(t *testing.T) {
+	const (
+		maxInt = "9223372036854775807"  // math.MaxInt64
+		minInt = "-9223372036854775808" // math.MinInt64
+	)
+
+	tests := []struct {
+		name    string
+		start   *string // value stored before the call; nil means the key is missing
+		delta   int64
+		want    int64
+		wantErr error
+	}{
+		{"new key +1", nil, 1, 1, nil},
+		{"existing +1", ptr("10"), 1, 11, nil},
+		{"new key -1", nil, -1, -1, nil},
+		{"negative value", ptr("-5"), 1, -4, nil},
+		{"zero", ptr("0"), -1, -1, nil},
+		{"max -1 is fine", ptr(maxInt), -1, 9223372036854775806, nil},
+
+		{"not a number", ptr("abc"), 1, 0, ErrNotInteger},
+		{"leading plus", ptr("+5"), 1, 0, ErrNotInteger},
+		{"leading space", ptr(" 5"), 1, 0, ErrNotInteger},
+		{"trailing space", ptr("5 "), 1, 0, ErrNotInteger},
+		{"leading zero", ptr("05"), 1, 0, ErrNotInteger},
+		{"minus zero", ptr("-0"), 1, 0, ErrNotInteger},
+		{"decimal", ptr("1.5"), 1, 0, ErrNotInteger},
+		{"empty string", ptr(""), 1, 0, ErrNotInteger},
+		{"bigger than int64", ptr("9223372036854775808"), -1, 0, ErrNotInteger},
+
+		{"INCR at max int64", ptr(maxInt), 1, 0, ErrOverflow},
+		{"DECR at min int64", ptr(minInt), -1, 0, ErrOverflow},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			if tt.start != nil {
+				if err := s.Set("k", *tt.start); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := s.IncrBy("k", tt.delta)
+			if !errors.Is(err, tt.wantErr) || got != tt.want {
+				t.Fatalf("IncrBy(%d) = %d, %v; want %d, %v", tt.delta, got, err, tt.want, tt.wantErr)
+			}
+
+			// On error the stored value must be untouched.
+			if tt.wantErr != nil {
+				val, ok, _ := s.Get("k")
+				if !ok || val != *tt.start {
+					t.Errorf("after error, value = %q (exists=%v); want %q unchanged", val, ok, *tt.start)
+				}
+				return
+			}
+			// On success the new value is stored as a decimal string.
+			if val, _, _ := s.Get("k"); val != fmt.Sprint(tt.want) {
+				t.Errorf("stored value = %q, want %q", val, fmt.Sprint(tt.want))
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+// If IncrBy did Get() then Set() without holding the lock the whole time,
+// increments would be lost and the final count would be less than 100.
+// Run with -race (make test does this).
+func TestIncrConcurrent(t *testing.T) {
+	s := New()
+	const n = 100
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.IncrBy("counter", 1); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, _, _ := s.Get("counter")
+	if got != fmt.Sprint(n) {
+		t.Fatalf("counter = %s after %d concurrent INCRs, want %d", got, n, n)
+	}
+}

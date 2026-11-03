@@ -90,3 +90,39 @@ func TestExistsCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestIncrDecrCommands(t *testing.T) {
+	h := NewHandler(store.New())
+
+	steps := []struct {
+		args []string
+		want resp.Value
+	}{
+		{[]string{"INCR"}, resp.NewError("ERR wrong number of arguments for 'incr' command")},
+		{[]string{"INCR", "a", "b"}, resp.NewError("ERR wrong number of arguments for 'incr' command")},
+		{[]string{"DECR"}, resp.NewError("ERR wrong number of arguments for 'decr' command")},
+		{[]string{"DECR", "a", "b"}, resp.NewError("ERR wrong number of arguments for 'decr' command")},
+
+		{[]string{"INCR", "counter"}, resp.NewInteger(1)}, // missing key starts at 0
+		{[]string{"incr", "counter"}, resp.NewInteger(2)}, // case-insensitive
+		{[]string{"DECR", "counter"}, resp.NewInteger(1)},
+		{[]string{"GET", "counter"}, resp.NewBulkString("1")}, // stored as a string
+		{[]string{"DECR", "fresh"}, resp.NewInteger(-1)},
+
+		{[]string{"SET", "name", "redis"}, resp.OK()},
+		{[]string{"INCR", "name"}, resp.NewError("ERR value is not an integer or out of range")},
+		{[]string{"DECR", "name"}, resp.NewError("ERR value is not an integer or out of range")},
+		{[]string{"GET", "name"}, resp.NewBulkString("redis")}, // unchanged
+
+		{[]string{"SET", "big", "9223372036854775807"}, resp.OK()},
+		{[]string{"INCR", "big"}, resp.NewError("ERR increment or decrement would overflow")},
+		{[]string{"GET", "big"}, resp.NewBulkString("9223372036854775807")}, // unchanged
+		{[]string{"SET", "small", "-9223372036854775808"}, resp.OK()},
+		{[]string{"DECR", "small"}, resp.NewError("ERR increment or decrement would overflow")},
+	}
+	for _, s := range steps {
+		if got := h.Handle(s.args); !reflect.DeepEqual(got, s.want) {
+			t.Errorf("Handle(%q) = %#v, want %#v", s.args, got, s.want)
+		}
+	}
+}

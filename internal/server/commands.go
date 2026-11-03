@@ -32,6 +32,8 @@ func NewHandler(s *store.Store) *Handler {
 		"GET":     h.get,
 		"DEL":     h.del,
 		"EXISTS":  h.exists,
+		"INCR":    h.incr,
+		"DECR":    h.decr,
 		// TODO(milestone 4): "EXISTS", "INCR", "EXPIRE", "TTL", ...
 	}
 	return h
@@ -128,6 +130,33 @@ func (h *Handler) exists(args []string) resp.Value {
 		return storeError("EXISTS", err)
 	}
 	return resp.NewInteger(int64(n))
+}
+
+// INCR key -> the value after adding 1 (a missing key starts at 0)
+func (h *Handler) incr(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("incr")
+	}
+	return h.incrBy("INCR", args[0], 1)
+}
+
+// DECR key -> the value after subtracting 1 (a missing key starts at 0)
+func (h *Handler) decr(args []string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs("decr")
+	}
+	return h.incrBy("DECR", args[0], -1)
+}
+
+// incrBy is the part INCR and DECR share. storeError turns
+// store.ErrNotInteger and store.ErrOverflow into the exact Redis replies,
+// e.g. "ERR value is not an integer or out of range".
+func (h *Handler) incrBy(cmd, key string, delta int64) resp.Value {
+	n, err := h.store.IncrBy(key, delta)
+	if err != nil {
+		return storeError(cmd, err)
+	}
+	return resp.NewInteger(n)
 }
 
 func wrongArgs(cmd string) resp.Value {

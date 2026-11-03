@@ -3,12 +3,21 @@ package store
 
 import (
 	"errors"
+	"math"
+	"strconv"
 	"sync"
 )
 
 // ErrNotImplemented is still used by the tests and the command handler,
 // so keep it for now. We'll clean it up in a later milestone.
 var ErrNotImplemented = errors.New("not implemented yet")
+
+// Errors returned by IncrBy. The text matches real Redis, because the
+// command handler sends it to the client as "ERR " + err.Error().
+var (
+	ErrNotInteger = errors.New("value is not an integer or out of range")
+	ErrOverflow   = errors.New("increment or decrement would overflow")
+)
 
 // Store is a thread-safe map from string keys to string values.
 //
@@ -74,4 +83,54 @@ func (s *Store) Exists(keys ...string) (count int, err error) {
 		}
 	}
 	return count, nil
+}
+
+// IncrBy adds delta to the integer stored at key and returns the new value.
+// INCR is IncrBy(key, 1) and DECR is IncrBy(key, -1).
+//
+// A missing key counts as 0. If the stored value is not an integer, or the
+// result would not fit in an int64, it returns an error and leaves the value
+// unchanged.
+func (s *Store) IncrBy(key string, delta int64) (int64, error) {
+	// One write lock around the whole read-modify-write. If we called Get()
+	// and then Set(), another client could change the key in between and
+	// one of the two increments would be lost.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var current int64 // a missing key counts as 0
+	if str, ok := s.data[key]; ok {
+		n, ok := parseInt(str)
+		if !ok {
+			return 0, ErrNotInteger
+		}
+		current = n
+	}
+
+	// Check for overflow BEFORE adding: in Go, int64 addition silently
+	// wraps around (MaxInt64 + 1 becomes MinInt64), so afterwards it's too late.
+	if delta > 0 && current > math.MaxInt64-delta {
+		return 0, ErrOverflow
+	}
+	if delta < 0 && current < math.MinInt64-delta {
+		return 0, ErrOverflow
+	}
+
+	current += delta
+	s.data[key] = strconv.FormatInt(current, 10)
+	return current, nil
+}
+
+// parseInt parses s as a base-10 int64 as strictly as Redis does.
+//
+// strconv.ParseInt alone is too lenient: it accepts "+5" and "05". So we
+// also require that formatting the number again gives back exactly s. That
+// rules out a leading "+", leading zeros and "-0", and ParseInt itself
+// already rejects "", spaces, "1.5" and numbers outside the int64 range.
+func parseInt(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || strconv.FormatInt(n, 10) != s {
+		return 0, false
+	}
+	return n, true
 }
